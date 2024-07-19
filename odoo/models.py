@@ -3047,6 +3047,21 @@ class BaseModel(metaclass=MetaModel):
                               row['attname'], self._table, self._name)
             if row['attnotnull']:
                 tools.drop_not_null(cr, self._table, row['attname'])
+                
+    @api.model_cr
+    def _is_replication(self, log=False):
+        # check in some table , to see if is a replication table        
+
+        cr = self._cr
+        sql = """ SELECT COUNT(1) 
+                FROM pglogical.replication_set_table 
+                WHERE set_reloid::text = '{table}' ;""".format(table = self._table)
+        cr.execute(sql)
+
+        if cr.rowcount >= 1:
+            return True
+        else:
+            return False
 
     def _init_column(self, column_name):
         """ Initialize the value of the given column for existing rows. """
@@ -3138,6 +3153,12 @@ class BaseModel(metaclass=MetaModel):
                     continue
                 if field.manual and not update_custom_fields:
                     continue            # don't update custom fields
+                
+                if odoo.tools.config['replica'] == True:
+                    if self._is_replication():
+                        _logger.warn("es replica no actualizo")
+                        continue
+                
                 new = field.update_db(self, columns)
                 if new and field.compute:
                     fields_to_compute.append(field)
