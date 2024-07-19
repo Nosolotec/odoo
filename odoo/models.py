@@ -3048,7 +3048,6 @@ class BaseModel(metaclass=MetaModel):
             if row['attnotnull']:
                 tools.drop_not_null(cr, self._table, row['attname'])
                 
-    @api.model_cr
     def _is_replication(self, log=False):
         # check in some table , to see if is a replication table        
 
