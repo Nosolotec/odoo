@@ -79,28 +79,36 @@ class AccountFiscalPosition(models.Model):
             if bool(position.zip_from) != bool(position.zip_to) or position.zip_from > position.zip_to:
                 raise ValidationError(_('Invalid "Zip Range", You have to configure both "From" and "To" values for the zip range and "To" should be greater than "From".'))
 
-    @api.constrains('country_id', 'state_ids', 'foreign_vat')
+    @api.constrains('country_id', 'country_group_id', 'state_ids', 'foreign_vat')
     def _validate_foreign_vat_country(self):
         for record in self:
             if record.foreign_vat:
                 if record.country_id == record.company_id.account_fiscal_country_id:
-                    if record.foreign_vat == record.company_id.vat:
-                        raise ValidationError(_("You cannot create a fiscal position within your fiscal country with the same VAT number as the main one set on your company."))
-
                     if not record.state_ids:
                         if record.company_id.account_fiscal_country_id.state_ids:
                             raise ValidationError(_("You cannot create a fiscal position with a foreign VAT within your fiscal country without assigning it a state."))
-                        else:
-                            raise ValidationError(_("You cannot create a fiscal position with a foreign VAT within your fiscal country."))
+                if record.country_group_id and record.country_id:
+                    if record.country_id not in record.country_group_id.country_ids:
+                        raise ValidationError(_("You cannot create a fiscal position with a country outside of the selected country group."))
 
                 similar_fpos_domain = [
                     *self.env['account.fiscal.position']._check_company_domain(record.company_id),
                     ('foreign_vat', '!=', False),
-                    ('country_id', '=', record.country_id.id),
                     ('id', '!=', record.id),
                 ]
+
+                if record.country_group_id:
+                    foreign_vat_country = self.country_group_id.country_ids.filtered(lambda c: c.code == record.foreign_vat[:2].upper())
+                    if not foreign_vat_country:
+                        raise ValidationError(_("The country code of the foreign VAT number does not match any country in the group."))
+                    similar_fpos_domain += [('country_group_id', '=', record.country_group_id.id), ('country_id', '=', foreign_vat_country.id)]
+                elif record.country_id:
+                    similar_fpos_domain += [('country_id', '=', record.country_id.id), ('country_group_id', '=', False)]
+
                 if record.state_ids:
                     similar_fpos_domain.append(('state_ids', 'in', record.state_ids.ids))
+                else:
+                    similar_fpos_domain.append(('state_ids', '=', False))
 
                 similar_fpos_count = self.env['account.fiscal.position'].search_count(similar_fpos_domain)
                 if similar_fpos_count:
@@ -135,14 +143,14 @@ class AccountFiscalPosition(models.Model):
     @api.onchange('country_id')
     def _onchange_country_id(self):
         if self.country_id:
-            self.zip_from = self.zip_to = self.country_group_id = False
+            self.zip_from = self.zip_to = False
             self.state_ids = [(5,)]
             self.states_count = len(self.country_id.state_ids)
 
     @api.onchange('country_group_id')
     def _onchange_country_group_id(self):
         if self.country_group_id:
-            self.zip_from = self.zip_to = self.country_id = False
+            self.zip_from = self.zip_to = False
             self.state_ids = [(5,)]
 
     @api.model
@@ -236,16 +244,39 @@ class AccountFiscalPosition(models.Model):
         if not partner:
             return self.env['account.fiscal.position']
 
-        company = self.env.company
-        intra_eu = vat_exclusion = False
-        if company.vat and partner.vat:
-            eu_country_codes = set(self.env.ref('base.europe').country_ids.mapped('code'))
-            intra_eu = company.vat[:2] in eu_country_codes and partner.vat[:2] in eu_country_codes
-            vat_exclusion = company.vat[:2] == partner.vat[:2]
-
-        # If company and partner have the same vat prefix (and are both within the EU), use invoicing
-        if not delivery or (intra_eu and vat_exclusion):
+        # If no "delivery" partner is specified, we assume it will be the "invoicing" partner.
+        if not delivery:
             delivery = partner
+
+        company = self.env.company
+
+        # The purpose of this part is to avoid making (lot of) extra queries by using ref on 'base.europe'
+        res_model, res_id = self.env['ir.model.data']._xmlid_to_res_model_res_id('base.europe')
+        eu_country_group = self.env[res_model].browse(res_id)
+        eu_country_codes = set(eu_country_group.country_ids.mapped('code'))
+
+        delivery_country = delivery.country_id
+        vat_valid = self._get_vat_valid(partner, company)
+
+        eu_vat_partner = partner.vat and partner.vat[:2] in eu_country_codes
+        eu_partner = partner.country_code in eu_country_codes
+        eu_delivery = delivery.country_code in eu_country_codes
+        domestic_delivery = delivery_country == company.country_id
+        external_delivery = delivery_country != partner.country_id
+
+        # If the delivery is to a different country than the partner's country (external delivery),
+        # the delivery is within the EU, and the partner does not have a valid EU VAT number,
+        # then assign the company's country as the delivery country) and force vat_valid to True
+        # in order to get the domestic FP
+        if external_delivery and eu_delivery and not eu_vat_partner:
+            delivery_country = company.country_id
+            vat_valid = True
+
+        # If the delivery is to the same country as the company's country (domestic delivery),
+        # the partner has a valid EU VAT number but is not from EU,
+        # we need to force vat_valid to False in order to get the EU private FP
+        if domestic_delivery and eu_vat_partner and not eu_partner:
+            vat_valid = False
 
         # partner manually set fiscal position always win
         manual_fiscal_position = (
@@ -256,12 +287,11 @@ class AccountFiscalPosition(models.Model):
             return manual_fiscal_position
 
         # First search only matching VAT positions
-        vat_valid = self._get_vat_valid(delivery, company)
-        fp = self._get_fpos_by_region(delivery.country_id.id, delivery.state_id.id, delivery.zip, vat_valid)
+        fp = self._get_fpos_by_region(delivery_country.id, delivery.state_id.id, delivery.zip, vat_valid)
 
         # Then if VAT required found no match, try positions that do not require it
         if not fp and vat_valid:
-            fp = self._get_fpos_by_region(delivery.country_id.id, delivery.state_id.id, delivery.zip, False)
+            fp = self._get_fpos_by_region(delivery_country.id, delivery.state_id.id, delivery.zip, False)
 
         return fp or self.env['account.fiscal.position']
 
@@ -899,6 +929,10 @@ class ResPartner(models.Model):
                 [('company_id', '=', False)],
             ):
                 partner = search_method(extra_domain)
+
+                # The VAT should be a sufficiently distinctive criterion
+                if partner and search_method == search_with_vat:
+                    return partner[:1]
                 if partner and len(partner) == 1:
                     return partner
         return self.env['res.partner']
